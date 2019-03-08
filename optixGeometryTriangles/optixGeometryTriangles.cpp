@@ -411,7 +411,6 @@ GeometryGroup createGeometryTriangles()
     return tri_gg;
 }
 
-
 GeometryGroup createGeometry()
 {
     // Sphere geometry
@@ -459,19 +458,363 @@ GeometryGroup createGeometry()
     return gg;
 }
 
+std::string prettyName(std::string str)
+{
+    if (str.empty())
+        return "[undefined]";
+    return str;
+}
 
-void setupScene()
+const std::unordered_map<int, size_t> glType = {
+    { TINYGLTF_TYPE_VEC2, 2 },
+    { TINYGLTF_TYPE_VEC3, 3 },
+    { TINYGLTF_TYPE_VEC4, 4 },
+    { TINYGLTF_TYPE_MAT2, 4 },
+    { TINYGLTF_TYPE_MAT3, 9 },
+    { TINYGLTF_TYPE_MAT4, 16 },
+    { TINYGLTF_TYPE_SCALAR, 1 },
+    { TINYGLTF_TYPE_VECTOR, 4 },
+    { TINYGLTF_TYPE_MATRIX, 16 },
+};
+
+const std::unordered_map<int, size_t> glParamTypeToByteSize = {
+    { TINYGLTF_PARAMETER_TYPE_BYTE, sizeof(char) },
+    { TINYGLTF_PARAMETER_TYPE_UNSIGNED_BYTE, sizeof(unsigned char) },
+    { TINYGLTF_PARAMETER_TYPE_SHORT, sizeof(short) },
+    { TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT, sizeof(unsigned short) },
+    { TINYGLTF_PARAMETER_TYPE_INT, sizeof(int32_t) },
+    { TINYGLTF_PARAMETER_TYPE_UNSIGNED_INT, sizeof(uint32_t) },
+    { TINYGLTF_PARAMETER_TYPE_FLOAT, sizeof(float) }
+};
+
+template <typename T, size_t C>
+size_t loadGltfBuffer(const size_t accesorIndex, const std::string & bufferName, const tinygltf::Model & model, std::vector<T> & outBuffer)
+{
+    const size_t componentCount = C;
+    const tinygltf::Accessor & accessor = model.accessors[accesorIndex];
+    const tinygltf::BufferView & bufferView = model.bufferViews[accessor.bufferView];
+    const tinygltf::Buffer & buffer = model.buffers[bufferView.buffer];
+
+    if (glType.at(accessor.type) != componentCount)
+    {
+        std::cerr << "[GLTF] Buffer \'" << bufferName << "\': found component count (" << glType.at(accessor.type) << ") is not as expected (" << componentCount << "). Cancel buffer import";
+        return -1;
+    }
+
+    outBuffer.resize(accessor.count * componentCount);
+    const size_t offset = accessor.byteOffset + bufferView.byteOffset;
+    const size_t byteStride = (bufferView.byteStride == 0) ? glParamTypeToByteSize.at(accessor.componentType) * componentCount : bufferView.byteStride;
+
+    for (size_t i = 0; i < accessor.count; ++i)
+    {
+        const size_t index = offset + i * byteStride;
+        for (size_t c = 0; c < componentCount; ++c)
+        {
+            const size_t componentIndex = index + c * glParamTypeToByteSize.at(accessor.componentType);
+            T data;
+            switch (accessor.componentType)
+            {
+            case TINYGLTF_PARAMETER_TYPE_BYTE:
+                data = (T)*(char*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_UNSIGNED_BYTE:
+                data = (T)*(unsigned char*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_SHORT:
+                data = (T)*(short*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT:
+                data = (T)*(unsigned short*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_INT:
+                data = (T)*(int32_t*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_UNSIGNED_INT:
+                data = (T)*(uint32_t*)(&buffer.data[componentIndex]);
+                break;
+            case TINYGLTF_PARAMETER_TYPE_FLOAT:
+                data = (T)*(float*)(&buffer.data[componentIndex]);
+                break;
+            default:
+                std::cerr << "[GLTF] Buffer \'" << bufferName << "\': data type is not supported (" << accessor.componentType << "). Cancel buffer import";
+                return -1;
+                break;
+            }
+            outBuffer[i * componentCount + c] = data;
+        }
+    }
+
+    return accessor.count;
+}
+
+size_t findVertexAttributeIndex(const tinygltf::Primitive & prim, const std::string & attrName)
+{
+    const auto & found = prim.attributes.find(attrName);
+    if (found != prim.attributes.end())
+        return found->second;
+    return -1;
+}
+
+using M44f = optix::Matrix4x4;
+using V3f = optix::float3;
+using V4f = optix::float4;
+
+// convert quaternions to euler angles (https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles#Quaternion_to_Euler_Angles_Conversion)
+inline
+V3f toEulerAngle(const V4f & q)
+{
+    V3f eulerAngles;
+
+    // roll (x-axis rotation)
+    double sinr_cosp = 2.f * (q.w * q.x + q.y * q.z);
+    double cosr_cosp = 1.f - 2.f * (q.x * q.x + q.y * q.y);
+    eulerAngles.x = atan2(sinr_cosp, cosr_cosp);
+
+    // pitch (y-axis rotation)
+    double sinp = +2.0 * (q.w * q.y - q.z * q.x);
+    if (fabs(sinp) >= 1)
+        eulerAngles.y = copysign(M_PI_2f, sinp); // use 90 degrees if out of range
+    else
+        eulerAngles.y = asin(sinp);
+
+    // yaw (z-axis rotation)
+    double siny_cosp = 2.f * (q.w * q.z + q.x * q.y);
+    double cosy_cosp = 1.f - 2.f * (q.y * q.y + q.z * q.z);
+    eulerAngles.z = atan2(siny_cosp, cosy_cosp);
+
+    return eulerAngles;
+}
+
+struct GltfInstance
+{
+    GltfInstance(std::string inName, M44f inTransform, int inMesh)
+        : name(inName)
+        , transform(inTransform)
+        , mesh(inMesh) {}
+
+    std::string name;
+    M44f transform;
+    int mesh = -1;
+};
+
+void recursivelyFindInstances(const tinygltf::Model & model, const tinygltf::Node & currentNode, const M44f& parentMatrix, std::vector<GltfInstance> & outInstances)
+{
+    M44f currentMatrix;
+    if (currentNode.matrix.size() == 16)
+    {
+        float floatMatrixData[16];
+        for (size_t i = 0; i < 16; ++i)
+            floatMatrixData[i] = (float) currentNode.matrix[i];
+        currentMatrix = M44f(&floatMatrixData[0]);
+    }
+    else
+    {
+        if (currentNode.translation.size() == 3)
+        {
+            V3f translation = optix::make_float3((float)currentNode.translation[0], (float)currentNode.translation[1], (float)currentNode.translation[2]);
+            currentMatrix.translate(translation);
+        }
+        if (currentNode.rotation.size() == 4)
+        {
+            V4f quaternions = optix::make_float4((float)currentNode.rotation[0], (float)currentNode.rotation[1], (float)currentNode.rotation[2], (float)currentNode.rotation[3]);
+            const auto eulerAngles = toEulerAngle(quaternions);
+            currentMatrix.rotate(eulerAngles.x, optix::make_float3(1, 0, 0));
+            currentMatrix.rotate(eulerAngles.y, optix::make_float3(0, 1, 0));
+            currentMatrix.rotate(eulerAngles.z, optix::make_float3(0, 0, 1));
+        }
+        if (currentNode.scale.size() == 3)
+        {
+            V3f scale = optix::make_float3((float)currentNode.scale[0], (float)currentNode.scale[1], (float)currentNode.scale[2]);
+            currentMatrix.scale(scale);
+        }
+    }
+
+    currentMatrix *= parentMatrix;
+
+    if (currentNode.mesh != -1)
+    {
+        outInstances.emplace_back(currentNode.name, currentMatrix, currentNode.mesh);
+    }
+    else
+    {
+        for (const auto & childIndex : currentNode.children)
+        {
+            recursivelyFindInstances(model, model.nodes[childIndex], currentMatrix, outInstances);
+        }
+    }
+}
+
+struct OptixInstance
+{
+    GeometryGroup gg;
+    Transform transform;
+
+    OptixInstance(GeometryGroup gg, Transform t) : gg(gg), transform(t) {}
+};
+
+std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
+{
+    tinygltf::Model model;
+    tinygltf::TinyGLTF loader;
+    std::string err;
+    std::string warn;
+
+    const auto ret = loader.LoadASCIIFromFile(&model, &err, &warn, input_gltf);
+
+    if (!warn.empty())
+        std::cerr << "tinygltf warning: " << warn << "\n";
+
+    if (!err.empty())
+        std::cerr << "tinygltf error: " << err << "\n";
+
+    if (!ret)
+    {
+        const auto msg = "Failed to parse glTF";
+        std::cerr << msg << "\n";
+        throw std::runtime_error(msg);
+    }
+
+    std::vector<GeometryTriangles> geometries;
+
+    for (size_t meshIdx = 0; meshIdx < model.meshes.size(); ++meshIdx)
+    {
+        const auto & mesh = model.meshes[meshIdx];
+        const auto & prim = mesh.primitives[0]; // only load the mesh's first primitive (limitation to break in the future)
+        if (prim.mode != TINYGLTF_MODE_TRIANGLES)
+        {
+            std::cerr << "Only triangle geometry is supported, skipping mesh " << meshIdx  << " named " << prettyName(mesh.name) << "\n";
+            continue;
+        }
+
+        // topology
+        std::vector<int32_t> indexBuffer;
+        const size_t indexCount = loadGltfBuffer<int32_t, 1>(prim.indices, "indices", model, indexBuffer);
+        if (indexCount == -1)
+            continue;
+        const auto triangleCount = indexCount / 3;
+
+        // mandatory vertex attributes : positions and normals
+        const size_t positionIndex = findVertexAttributeIndex(prim, "POSITION");
+        if (positionIndex == -1)
+        {
+            std::cerr << "[GLTF] Unable to find POSITION vertex attributes. Cancel mesh import";
+            continue;
+        }
+
+        const size_t normalIndex = findVertexAttributeIndex(prim, "NORMAL");
+        if (normalIndex == -1)
+        {
+            std::cerr << "[GLTF] Unable to find NORMAL vertex attributes. Cancel mesh import";
+            continue;
+        }
+
+        std::vector<float> positionData;
+        const size_t positionCount = loadGltfBuffer<float, 3>(positionIndex, "position", model, positionData);
+
+        std::vector<float> normalData;
+        const size_t normalCount = loadGltfBuffer<float, 3>(normalIndex, "normal", model, normalData);
+
+        std::vector<float> texcoordData;
+        const size_t texcoordCount = [&]() -> size_t {
+            const size_t texcoordIndex = findVertexAttributeIndex(prim, "TEXCOORD_0");
+            if (texcoordIndex == -1)
+            {
+                std::cerr << "[GLTF] Unable to find TEXCOORD_0 vertex attributes.";
+                return 0;
+            }
+            return loadGltfBuffer<float, 2>(texcoordIndex, "texcoord", model, texcoordData);
+        }();
+
+        // Create Buffers for the triangle vertices, normals, texture coordinates, and indices.
+        Buffer vertex_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT3, positionCount);
+        Buffer normal_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT3, normalCount);
+        Buffer texcoord_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT2, texcoordCount);
+        Buffer index_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_UNSIGNED_INT3, triangleCount);
+
+        // Copy the tetrahedron geometry into the device Buffers.
+        memcpy(vertex_buffer->map(), positionData.data(), positionData.size() * sizeof(positionData[0]));
+        memcpy(normal_buffer->map(), normalData.data(), normalData.size() * sizeof(normalData[0]));
+        if (texcoordCount > 0)
+            memcpy(texcoord_buffer->map(), texcoordData.data(), texcoordData.size() * sizeof(texcoordData[0]));
+        memcpy(index_buffer->map(), indexBuffer.data(), indexBuffer.size() * sizeof(indexBuffer[0]));
+
+        vertex_buffer->unmap();
+        normal_buffer->unmap();
+        if (texcoordCount > 0)
+            texcoord_buffer->unmap();
+        index_buffer->unmap();
+
+        // Create a GeometryTriangles object.
+        optix::GeometryTriangles geom_tri = context->createGeometryTriangles();
+
+        geom_tri->setPrimitiveCount(triangleCount);
+        geom_tri->setTriangleIndices(index_buffer, RT_FORMAT_UNSIGNED_INT3);
+        geom_tri->setVertices(positionCount, vertex_buffer, RT_FORMAT_FLOAT3);
+        geom_tri->setBuildFlags(RTgeometrybuildflags(0));
+
+        // Set an attribute program for the GeometryTriangles, which will compute
+        // things like normals and texture coordinates based on the barycentric
+        // coordindates of the intersection.
+        const char* ptx = sutil::getPtxString(SAMPLE_NAME, "optixGeometryTriangles.cu");
+        geom_tri->setAttributeProgram(context->createProgramFromPTXString(ptx, "triangle_attributes"));
+
+        geom_tri["index_buffer"]->setBuffer(index_buffer);
+        geom_tri["vertex_buffer"]->setBuffer(vertex_buffer);
+        geom_tri["normal_buffer"]->setBuffer(normal_buffer);
+        geom_tri["texcoord_buffer"]->setBuffer(texcoord_buffer);
+
+        geometries.emplace_back(geom_tri);
+    }
+
+    std::clog << "[GLTF] Load " << geometries.size() << " meshes";
+
+    Acceleration accel = context->createAcceleration("Trbvh");
+
+    std::vector<OptixInstance> instances;
+
+    for (const auto & gltfScene : model.scenes)
+    {
+        for (const auto & nodeIndex : gltfScene.nodes)
+        {
+            std::vector<GltfInstance> toImportInstances;
+            recursivelyFindInstances(model, model.nodes[nodeIndex], M44f(), toImportInstances);
+            for (const auto & gltfInst : toImportInstances)
+            {
+                std::clog << "[GLTF] Starting to load instance " << prettyName(gltfInst.name);
+
+                GeometryGroup gg = context->createGeometryGroup();
+                gg->setAcceleration(accel);
+
+                GeometryInstance gi = context->createGeometryInstance(geometries[gltfInst.mesh], normal_matl);
+                gg->addChild(gi);
+
+                Transform transform = context->createTransform();
+                //transform->setMatrix(true, gltfInst.transform.getData(), nullptr);
+                transform->setChild(gg);
+
+                instances.emplace_back(gg, transform);
+            }
+        }
+    }
+
+    return instances;
+}
+
+void setupScene(const std::string & input_gltf)
 {
     // Create a GeometryGroup for the GeometryTriangles instances and a separate
     // GeometryGroup for all other primitives.
     GeometryGroup tri_gg = createGeometryTriangles();
     GeometryGroup gg     = createGeometry();
+    auto gltf_instances = createGLTFGeometry(input_gltf);
 
     // Create a top-level Group to contain the two GeometryGroups.
     Group top_group = context->createGroup();
     top_group->setAcceleration( context->createAcceleration( "Trbvh" ) );
     top_group->addChild( gg );
     top_group->addChild( tri_gg );
+    for (const auto & inst: gltf_instances)
+        top_group->addChild(inst.transform);
 
     context["top_object"]->set( top_group );
     context["top_shadower"]->set( top_group );
@@ -742,6 +1085,7 @@ void printUsageAndExit( const std::string& argv0 )
 int main( int argc, char** argv )
 {
     std::string out_file;
+    std::string input_file;
     for( int i=1; i<argc; ++i )
     {
         const std::string arg( argv[i] );
@@ -763,6 +1107,15 @@ int main( int argc, char** argv )
         {
             use_pbo = false;
         }
+        else if (arg == "-i" || arg == "--input")
+        {
+            if (i == argc - 1)
+            {
+                std::cerr << "Option '" << arg << "' requires additional argument.\n";
+                printUsageAndExit(argv[0]);
+            }
+            input_file = argv[++i];
+        }
         else
         {
             std::cerr << "Unknown option '" << arg << "'\n";
@@ -780,7 +1133,7 @@ int main( int argc, char** argv )
 
         createContext();
         createMaterials();
-        setupScene();
+        setupScene(input_file);
         setupCamera();
         setupLights();
 
