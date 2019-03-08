@@ -55,6 +55,11 @@
 #include <iostream>
 #include <stdint.h>
 
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tinygltf/tiny_gltf.h>
+
 using namespace optix;
 
 const char* const SAMPLE_NAME = "optixGeometryTriangles";
@@ -723,6 +728,7 @@ void printUsageAndExit( const std::string& argv0 )
         "App Options:\n"
         "  -h | --help         Print this usage message and exit.\n"
         "  -f | --file         Save single frame to file and exit.\n"
+        "  -i | --input        Input gltf file.\n"
         "  -n | --nopbo        Disable GL interop for display buffer.\n"
         "App Keystrokes:\n"
         "  q  Quit\n"
