@@ -90,6 +90,8 @@ cmake_minimum_required(VERSION 2.8.8 FATAL_ERROR)
 # that all policies will use version 2.6 symantics.
 cmake_policy(VERSION 2.6)
 
+set(BAT_PATH_TO_VCVARSALL "$(VCInstallDir)vcvarsall.bat")
+
 # Add paths to our CMake code to the module path, so they can be found automatically by
 # CMake.
 set(CMAKE_MODULE_PATH
@@ -345,46 +347,15 @@ endfunction()
 # If you wish to start your own sample, you can copy one of the sample's directories.
 # Just make sure you rename all the occurances of the sample's name in the C code as well
 # and the CMakeLists.txt file.
-add_subdirectory(optixBuffersOfBuffers)
-add_subdirectory(optixCallablePrograms)
-add_subdirectory(optixCompressedTexture)
-add_subdirectory(optixConsole)
-add_subdirectory(optixDenoiser)
-add_subdirectory(optixDeviceQuery)
-add_subdirectory(optixDynamicGeometry)
 add_subdirectory(optixGeometryTriangles)
-add_subdirectory(optixHello)
-add_subdirectory(optixInstancing)
-add_subdirectory(optixMDLDisplacement)
-add_subdirectory(optixMDLExpressions)
-add_subdirectory(optixMDLSphere)
-add_subdirectory(optixMeshViewer)
-add_subdirectory(optixMotionBlur)
-add_subdirectory(optixParticles)
-add_subdirectory(optixPathTracer)
-add_subdirectory(optixPrimitiveIndexOffsets)
-add_subdirectory(optixRaycasting)
-add_subdirectory(optixSelector)
-add_subdirectory(optixSphere)
-add_subdirectory(optixSpherePP)
-add_subdirectory(optixSSIMPredictor)
-add_subdirectory(optixTextureSampler)
-add_subdirectory(optixTutorial)
-add_subdirectory(optixWhitted)
-add_subdirectory(primeInstancing)
-add_subdirectory(primeMasking)
-add_subdirectory(primeMultiBuffering)
-add_subdirectory(primeMultiGpu)
-add_subdirectory(primeSimple)
-add_subdirectory(primeSimplePP)
 
 # Our sutil library.  The rules to build it are found in the subdirectory.
 add_subdirectory(sutil)
 
 # This copies out dlls into the build directories, so that users no longer need to copy
-# them over in order to run the samples.  This depends on the optixHello sample being compiled.
+# them over in order to run the samples.  This depends on the optixGeometryTriangles sample being compiled.
 # If you remove this sample from the list of compiled samples, then you should change
-# "optixHello" found below to the name of one of your other samples.
+# "optixGeometryTriangles" found below to the name of one of your other samples.
 if(WIN32)
   if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT APPLE)
     set(bit_dest "64")
@@ -393,7 +364,7 @@ if(WIN32)
   endif()
   foreach(config ${CMAKE_CONFIGURATION_TYPES})
     cmake_policy(SET CMP0026 OLD)  # disable warning about LOCATION property
-    get_target_property(loc optixHello ${config}_LOCATION)
+    get_target_property(loc optixGeometryTriangles ${config}_LOCATION)
     if(loc)
       # A little helper function
       function(copy_dll lib)
