@@ -76,12 +76,26 @@ uint32_t height  = 768u;
 bool     use_pbo = true;
 
 // Camera state
-float3         camera_up;
-float3         camera_lookat;
-float3         camera_eye;
-Matrix4x4      camera_rotate;
-bool           camera_dirty = true;  // Do camera params need to be copied to OptiX context
-sutil::Arcball arcball;
+//float3         camera_up;
+//float3         camera_lookat;
+//float3         camera_eye;
+//Matrix4x4      camera_rotate;
+//bool           camera_dirty = true;  // Do camera params need to be copied to OptiX context
+//sutil::Arcball arcball;
+
+float3 camera_lookat;
+float camera_phi = 0, camera_theta = 0;
+float camera_dist = 1.f;
+bool camera_dirty = true;
+
+void computeCameraVectors(float3 & camera_eye, float3 & camera_up)
+{
+    const auto cos_theta = cos(camera_theta);
+    const float3 cam_z = make_float3(cos_theta * sin(camera_phi), sin(camera_theta), cos_theta * cos(camera_phi));
+
+    camera_eye = camera_lookat + cam_z * camera_dist;
+    camera_up = make_float3(0.f, 1.f, 0.f);
+}
 
 float3 bboxMin = make_float3(std::numeric_limits<float>::max());
 float3 bboxMax = make_float3(std::numeric_limits<float>::lowest());
@@ -427,9 +441,9 @@ GeometryGroup createGround(float groundHeight = 0)
     parallelogram->setBoundingBoxProgram(context->createProgramFromPTXString(ptx, "bounds"));
     parallelogram->setIntersectionProgram(context->createProgramFromPTXString(ptx, "intersect"));
 
-    float3 anchor = make_float3(-8.0f, -1e-3f, -8.0f);
-    float3 v1 = make_float3(16.0f, groundHeight, 0.0f);
-    float3 v2 = make_float3(0.0f, groundHeight, 16.0f);
+    float3 anchor = make_float3(-8.0f, groundHeight, -8.0f);
+    float3 v1 = make_float3(16.0f, 0.f, 0.0f);
+    float3 v2 = make_float3(0.0f, 0.f, 16.0f);
     float3 normal = normalize(cross(v1, v2));
 
     float d = dot(normal, anchor);
@@ -990,10 +1004,27 @@ void setupCamera()
 {
     const auto bboxDiag = bboxMax - bboxMin;
 
-    camera_eye = bboxMax + bboxDiag;
+    const auto eye = bboxMax + bboxDiag;
     camera_lookat = (bboxMax + bboxMin) * 0.5f;
-    camera_up     = make_float3(0, 1.f, 0);
-    camera_rotate = Matrix4x4::identity();
+
+    auto cam_z = eye - camera_lookat;
+    camera_dist = length(cam_z);
+    cam_z /= camera_dist;
+
+    const auto cos_theta = length(make_float2(cam_z.x, cam_z.z));
+    const auto sin_theta = cam_z.y;
+    const auto cos_phi = cam_z.z / cos_theta;
+    const auto sin_phi = cam_z.x / cos_theta;
+
+    camera_theta = atan2(sin_theta, cos_theta);
+    camera_phi = atan2(sin_phi, cos_phi);
+
+    //camera_lookat = (bboxMax + bboxMin) * 0.5f;
+    //camera_lookat.y = bboxMin.y;
+    //camera_dist = 10.f;
+    //camera_theta = 0.f;
+    //camera_phi = 0.f;
+
     camera_dirty  = true;
 }
 
@@ -1022,31 +1053,39 @@ void updateCamera()
     const float aspect_ratio = static_cast<float>(width) /
         static_cast<float>(height);
 
+    float3 cam_eye;
+    float3 cam_up;
+    computeCameraVectors(cam_eye, cam_up);
+
     float3 camera_u, camera_v, camera_w;
     sutil::calculateCameraVariables(
-            camera_eye, camera_lookat, camera_up, vfov, aspect_ratio,
-            camera_u, camera_v, camera_w, /*fov_is_vertical*/ true );
+        cam_eye, camera_lookat, cam_up, vfov, aspect_ratio,
+        camera_u, camera_v, camera_w, /*fov_is_vertical*/ true );
 
     const Matrix4x4 frame = Matrix4x4::fromBasis(
             normalize( camera_u ),
             normalize( camera_v ),
             normalize( -camera_w ),
             camera_lookat);
-    const Matrix4x4 frame_inv = frame.inverse();
-    // Apply camera rotation twice to match old SDK behavior
-    const Matrix4x4 trans   = frame*camera_rotate*camera_rotate*frame_inv;
 
-    camera_eye    = make_float3( trans*make_float4( camera_eye,    1.0f ) );
-    camera_lookat = make_float3( trans*make_float4( camera_lookat, 1.0f ) );
-    camera_up     = make_float3( trans*make_float4( camera_up,     0.0f ) );
 
-    sutil::calculateCameraVariables(
-            camera_eye, camera_lookat, camera_up, vfov, aspect_ratio,
-            camera_u, camera_v, camera_w, true );
 
-    camera_rotate = Matrix4x4::identity();
+    //const Matrix4x4 frame_inv = frame.inverse();
 
-    context["eye"]->setFloat( camera_eye );
+    //// Apply camera rotation twice to match old SDK behavior
+    //const Matrix4x4 trans   = frame*camera_rotate*frame_inv;
+
+    //camera_eye    = make_float3( trans*make_float4( camera_eye,    1.0f ) );
+    //camera_lookat = make_float3( trans*make_float4( camera_lookat, 1.0f ) );
+    //camera_up     = make_float3( trans*make_float4( camera_up,     0.0f ) );
+
+    //sutil::calculateCameraVariables(
+    //        camera_eye, camera_lookat, camera_up, vfov, aspect_ratio,
+    //        camera_u, camera_v, camera_w, true );
+
+    //camera_rotate = Matrix4x4::identity();
+
+    context["eye"]->setFloat(cam_eye);
     context["U"  ]->setFloat( camera_u );
     context["V"  ]->setFloat( camera_v );
     context["W"  ]->setFloat( camera_w );
@@ -1185,8 +1224,11 @@ void glutMouseMotion( int x, int y)
                          static_cast<float>( height );
         const float dmax = fabsf( dx ) > fabs( dy ) ? dx : dy;
         const float scale = fminf( dmax, 0.9f );
-        camera_eye = camera_eye + (camera_lookat - camera_eye)*scale;
-        camera_dirty = true;
+        if (scale != 0.f)
+        {
+            camera_dist = camera_dist * (1 + scale);
+            camera_dirty = true;
+        }
     }
     else if( mouse_button == GLUT_LEFT_BUTTON )
     {
@@ -1198,10 +1240,16 @@ void glutMouseMotion( int x, int y)
         const float2 a = { from.x / width, from.y / height };
         const float2 b = { to.x   / width, to.y   / height };
 
-        const auto v = camera_eye - camera_lookat;
-        const auto rotated = M44f::rotate(a.x - b.x, camera_up) * make_float4(v.x, v.y, v.z, 0);
-        const auto rotated_3 = make_float3(rotated.x, rotated.y, rotated.z);
-        camera_eye = camera_lookat + rotated_3;
+        camera_phi += -(b.x - a.x);
+        camera_theta += (b.y - a.y);
+        camera_dirty = true;
+
+        //camera_rotate = M44f::rotate(b.y - a.y, make_float3(1.f, 1.f, 0.f)) * M44f::rotate(a.x - b.x, make_float3(0.f, 1.f, 0.f));
+
+        //const auto v = camera_eye - camera_lookat;
+        //const auto rotated = M44f::rotate(a.x - b.x, camera_up) * make_float4(v.x, v.y, v.z, 0);
+        //const auto rotated_3 = make_float3(rotated.x, rotated.y, rotated.z);
+        //camera_eye = camera_lookat + rotated_3;
 
         //const auto v2 = camera_eye - camera_lookat;
         //const auto camera_left = optix::cross(rotated_3, camera_up);
