@@ -60,6 +60,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <tinygltf/tiny_gltf.h>
 
+#undef OPAQUE
+
 using namespace optix;
 
 const char* const SAMPLE_NAME = "optixGeometryTriangles";
@@ -116,6 +118,62 @@ GeometryInstance tri_gi;
 GeometryInstance sphere_gi;
 GeometryInstance plane_gi;
 
+using M44f = optix::Matrix4x4;
+using V3f = optix::float3;
+using V4f = optix::float4;
+
+struct OptixInstance
+{
+    GeometryInstance gi;
+    GeometryGroup gg;
+    Transform transform;
+    size_t meshIdx;
+    M44f localToWorld;
+
+    OptixInstance(GeometryInstance gi, GeometryGroup gg, Transform t, size_t meshIdx, const M44f & mat)
+        : gi(gi), gg(gg), transform(t), meshIdx{ meshIdx }, localToWorld{ mat } {}
+};
+
+std::vector<OptixInstance> gltf_instances;
+
+struct pbrMetalRoughnessMaterial
+{
+    enum class AlphaMode
+    {
+        OPAQUE, MASK, BLEND
+    };
+
+    int baseColorTextureIndex = -1;
+    int baseColorTextureCoordsIndex = 0;
+    float3 baseColorFactor = make_float3(1.f);
+
+    float opacityFactor = 1.f;
+
+    int metallicRoughnessTextureIndex = -1;
+    int metallicRoughnessTextureCoordsIndex = 0;
+
+    float metallicFactor = 1.f;
+    float roughnessFactor = 1.f;
+
+    int normalTextureIndex = -1;
+    int normalTextureCoordsIndex = 0;
+    float normalTextureScale = 1.f;
+
+    int occlusionTextureIndex = -1;
+    int occlusionTextureCoordsIndex = 0;
+    float occlusionTextureStrength = 1.f;
+
+    int emissiveTextureIndex = -1;
+    int emissiveTextureCoordsIndex = 0;
+    float3 emissiveFactor = make_float3(0.f);
+
+    bool doubleSided = false;
+
+    AlphaMode alphaMode = AlphaMode::OPAQUE;
+    float alphaCutoff = 0.5f;
+};
+
+std::vector<pbrMetalRoughnessMaterial> gltf_materials;
 
 //------------------------------------------------------------------------------
 //
@@ -611,36 +669,6 @@ size_t findVertexAttributeIndex(const tinygltf::Primitive & prim, const std::str
     return -1;
 }
 
-using M44f = optix::Matrix4x4;
-using V3f = optix::float3;
-using V4f = optix::float4;
-
-// convert quaternions to euler angles (https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles#Quaternion_to_Euler_Angles_Conversion)
-inline
-V3f toEulerAngle(const V4f & q)
-{
-    V3f eulerAngles;
-
-    // roll (x-axis rotation)
-    double sinr_cosp = 2.f * (q.w * q.x + q.y * q.z);
-    double cosr_cosp = 1.f - 2.f * (q.x * q.x + q.y * q.y);
-    eulerAngles.x = atan2(sinr_cosp, cosr_cosp);
-
-    // pitch (y-axis rotation)
-    double sinp = +2.0 * (q.w * q.y - q.z * q.x);
-    if (fabs(sinp) >= 1)
-        eulerAngles.y = copysign(M_PI_2f, sinp); // use 90 degrees if out of range
-    else
-        eulerAngles.y = asin(sinp);
-
-    // yaw (z-axis rotation)
-    double siny_cosp = 2.f * (q.w * q.z + q.x * q.y);
-    double cosy_cosp = 1.f - 2.f * (q.y * q.y + q.z * q.z);
-    eulerAngles.z = atan2(siny_cosp, cosy_cosp);
-
-    return eulerAngles;
-}
-
 struct GltfInstance
 {
     GltfInstance(std::string inName, M44f inTransform, int inMesh)
@@ -707,16 +735,6 @@ void recursivelyFindInstances(const tinygltf::Model & model, const tinygltf::Nod
     }
 }
 
-struct OptixInstance
-{
-    GeometryGroup gg;
-    Transform transform;
-    size_t meshIdx;
-    M44f localToWorld;
-
-    OptixInstance(GeometryGroup gg, Transform t, size_t meshIdx, const M44f & mat) : gg(gg), transform(t), meshIdx{ meshIdx }, localToWorld{ mat } {}
-};
-
 V3f min(const V3f & lhs, const V3f & rhs)
 {
     return make_float3(std::min(lhs.x, rhs.x), std::min(lhs.y, rhs.y), std::min(lhs.z, rhs.z));
@@ -725,6 +743,100 @@ V3f min(const V3f & lhs, const V3f & rhs)
 V3f max(const V3f & lhs, const V3f & rhs)
 {
     return make_float3(std::max(lhs.x, rhs.x), std::max(lhs.y, rhs.y), std::max(lhs.z, rhs.z));
+}
+
+const tinygltf::Parameter * get(const tinygltf::ParameterMap & map, const std::string & name)
+{
+    const auto it = map.find(name);
+    if (it == end(map))
+        return nullptr;
+    return &(*it).second;
+}
+
+template<typename T>
+const T get(const tinygltf::Parameter & param, const std::string & name, T defaultValue)
+{
+    const auto it = param.json_double_value.find(name);
+    if (it != std::end(param.json_double_value)) {
+        return T(it->second);
+    }
+    return defaultValue;
+}
+
+pbrMetalRoughnessMaterial readMaterial(const tinygltf::Material & material)
+{
+    pbrMetalRoughnessMaterial m;
+
+    if (const auto baseColorTextureParameter = get(material.values, "baseColorTexture"); baseColorTextureParameter)
+    {
+        m.baseColorTextureIndex = baseColorTextureParameter->TextureIndex();
+        m.baseColorTextureCoordsIndex = baseColorTextureParameter->TextureTexCoord();
+    }
+
+    if (const auto baseColorFactorParameter = get(material.values, "baseColorFactor"); baseColorFactorParameter)
+    {
+        const auto color = baseColorFactorParameter->ColorFactor();
+        m.baseColorFactor = make_float3(color[0], color[1], color[2]);
+        m.opacityFactor = color[3];
+    }
+
+    if (const auto metallicRoughnessTextureParameter = get(material.values, "metallicRoughnessTexture"); metallicRoughnessTextureParameter)
+    {
+        m.metallicRoughnessTextureIndex = metallicRoughnessTextureParameter->TextureIndex();
+        m.metallicRoughnessTextureCoordsIndex = metallicRoughnessTextureParameter->TextureTexCoord();
+    }
+
+    if (const auto metallicFactorParameter = get(material.values, "metallicFactor"); metallicFactorParameter)
+        m.metallicFactor = metallicFactorParameter->Factor();
+
+    if (const auto roughnessFactorParameter = get(material.values, "roughnessFactor"); roughnessFactorParameter)
+        m.roughnessFactor = roughnessFactorParameter->Factor();
+
+    if (const auto normalTextureParameter = get(material.additionalValues, "normalTexture");  normalTextureParameter)
+    {
+        m.normalTextureIndex = normalTextureParameter->TextureIndex();
+        m.normalTextureCoordsIndex = normalTextureParameter->TextureTexCoord();
+        m.normalTextureScale = get(*normalTextureParameter, "scale", m.normalTextureScale);
+    }
+
+    if (const auto occlusionTextureParameter = get(material.additionalValues, "occlusionTexture"); occlusionTextureParameter)
+    {
+        m.occlusionTextureIndex = occlusionTextureParameter->TextureIndex();
+        m.occlusionTextureCoordsIndex = occlusionTextureParameter->TextureTexCoord();
+        m.occlusionTextureStrength = get(*occlusionTextureParameter, "strength", m.occlusionTextureStrength);
+    }
+
+    if (const auto emissiveTextureParameter = get(material.additionalValues, "emissiveTexture"); emissiveTextureParameter)
+    {
+        m.emissiveTextureIndex = emissiveTextureParameter->TextureIndex();
+        m.emissiveTextureCoordsIndex = emissiveTextureParameter->TextureTexCoord();
+    }
+
+    if (const auto emissiveFactorParameter = get(material.additionalValues, "emissiveFactor"); emissiveFactorParameter)
+    {
+        const auto color = emissiveFactorParameter->ColorFactor();
+        m.emissiveFactor = make_float3(color[0], color[1], color[2]);
+    }
+
+    if (const auto doubleSidedParameter = get(material.additionalValues, "doubleSided"); doubleSidedParameter)
+        m.doubleSided = doubleSidedParameter->bool_value;
+
+    if (const auto alphaModeParameter = get(material.additionalValues, "alphaMode"); alphaModeParameter)
+    {
+        if (alphaModeParameter->string_value == "OPAQUE")
+            m.alphaMode = pbrMetalRoughnessMaterial::AlphaMode::OPAQUE;
+        else if (alphaModeParameter->string_value == "MASK")
+            m.alphaMode = pbrMetalRoughnessMaterial::AlphaMode::MASK;
+        else if (alphaModeParameter->string_value == "BLEND")
+            m.alphaMode = pbrMetalRoughnessMaterial::AlphaMode::BLEND;
+        else
+            std::cerr << "[GLTF] Unknown alpha mode " << alphaModeParameter->string_value;
+    }
+
+    if (const auto alphaCutoffParameter = get(material.additionalValues, "alphaCutoff"); alphaCutoffParameter)
+        m.alphaCutoff = alphaCutoffParameter->Factor();
+
+    return m;
 }
 
 std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
@@ -747,6 +859,12 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
         const auto msg = "Failed to parse glTF";
         std::cerr << msg << "\n";
         throw std::runtime_error(msg);
+    }
+
+    for (size_t materialIdx = 0; materialIdx < model.materials.size(); ++materialIdx)
+    {
+        const auto & material = model.materials[materialIdx];
+        gltf_materials.emplace_back(readMaterial(material));
     }
 
     std::vector<GeometryTriangles> geometries;
@@ -902,6 +1020,7 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
                 }
 
                 const auto & mesh = model.meshes[gltfInst.mesh];
+
                 const auto geometryOffset = perMeshGeometryOffset[gltfInst.mesh];
 
                 for (size_t primIdx = 0; primIdx < mesh.primitives.size(); ++primIdx)
@@ -909,6 +1028,7 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
                     const auto & prim = mesh.primitives[primIdx];
                     if (prim.mode != TINYGLTF_MODE_TRIANGLES)
                     {
+                        std::clog << "[GLTF] Unsupported primitive mode " << prim.mode << std::endl;
                         continue;
                     }
 
@@ -928,12 +1048,13 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
                     transform->setMatrix(false, gltfInst.transform.getData(), nullptr);
                     transform->setChild(gg);
 
-                    instances.emplace_back(gg, transform, gltfInst.mesh, gltfInst.transform);
+                    instances.emplace_back(gi, gg, transform, gltfInst.mesh, gltfInst.transform);
                 }
             }
         }
     }
 
+    // Compute bbox from instances
     for (const auto & inst : instances)
     {
         const auto & mesh = model.meshes[inst.meshIdx];
@@ -979,7 +1100,7 @@ void setupScene(const std::string & input_gltf)
     // GeometryGroup for all other primitives.
     GeometryGroup tri_gg = createGeometryTriangles();
     GeometryGroup gg     = createGeometry();
-    auto gltf_instances = createGLTFGeometry(input_gltf);
+    gltf_instances = createGLTFGeometry(input_gltf);
 
     // Create a top-level Group to contain the two GeometryGroups.
     Group top_group = context->createGroup();
@@ -1007,9 +1128,10 @@ void setupCamera()
     const auto eye = bboxMax + bboxDiag;
     camera_lookat = (bboxMax + bboxMin) * 0.5f;
 
-    auto cam_z = eye - camera_lookat;
-    camera_dist = length(cam_z);
-    cam_z /= camera_dist;
+    const auto eyeToLookat = eye - camera_lookat;
+    camera_dist = length(eyeToLookat);
+
+    const auto cam_z = eyeToLookat / camera_dist;
 
     const auto cos_theta = length(make_float2(cam_z.x, cam_z.z));
     const auto sin_theta = cam_z.y;
@@ -1018,6 +1140,9 @@ void setupCamera()
 
     camera_theta = atan2(sin_theta, cos_theta);
     camera_phi = atan2(sin_phi, cos_phi);
+
+    camera_theta = M_PI_4f;
+    camera_phi = M_PI_4f;
 
     //camera_lookat = (bboxMax + bboxMin) * 0.5f;
     //camera_lookat.y = bboxMin.y;
@@ -1162,6 +1287,14 @@ void glutDisplay()
 
 void glutKeyboardPress( unsigned char k, int x, int y )
 {
+    const auto setMaterial = [&](const optix::Material & material)
+    {
+        for (auto & inst : gltf_instances)
+        {
+            inst.gi->setMaterial(0, material);
+        }
+    };
+
     switch( k )
     {
         case( 'm' ):
@@ -1169,15 +1302,15 @@ void glutKeyboardPress( unsigned char k, int x, int y )
             // Cycle through a few different materials.
             static int count = 0;
             if( ++count == 1 )
-                tri_gi->setMaterial( 0, normal_matl );
+                setMaterial(normal_matl);
             else if( count == 2 )
-                tri_gi->setMaterial( 0, bary_matl );
+                setMaterial(bary_matl);
             else if( count == 3 )
-                tri_gi->setMaterial( 0, tex_matl );
+                setMaterial(tex_matl);
             else if( count == 4 )
-                tri_gi->setMaterial( 0, checker_matl );
+                setMaterial(checker_matl);
             else
-                tri_gi->setMaterial( 0, phong_matl );
+                setMaterial(phong_matl);
 
             count %= 5;
             camera_dirty = true;

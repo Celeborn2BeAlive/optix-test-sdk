@@ -48,7 +48,9 @@ if(GLUT_FOUND AND OPENGL_FOUND)
         phong.h
         random.h
         sphere.cu
-        )
+        pbrMetallicRoughness.h
+        pbrMetallicRoughness.cu
+    )
     
     target_include_directories(
         optixGeometryTriangles

@@ -90,6 +90,8 @@ cmake_minimum_required(VERSION 2.8.8 FATAL_ERROR)
 # that all policies will use version 2.6 symantics.
 cmake_policy(VERSION 2.6)
 
+set(CMAKE_CXX_STANDARD 17)
+
 set(BAT_PATH_TO_VCVARSALL "$(VCInstallDir)vcvarsall.bat")
 
 # Add paths to our CMake code to the module path, so they can be found automatically by
