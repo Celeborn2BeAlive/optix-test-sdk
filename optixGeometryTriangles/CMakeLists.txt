@@ -39,6 +39,7 @@ if(GLUT_FOUND AND OPENGL_FOUND)
         # These files are common among multiple samples
         accum_camera.cu
         checker.cu
+        checker_pbr.cu
         common.h
         constantbg.cu
         helpers.h

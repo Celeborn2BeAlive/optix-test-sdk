@@ -28,6 +28,7 @@
 
 #include <optix_world.h>
 
+rtDeclareVariable(optix::Ray, ray, rtCurrentRay, );
 rtDeclareVariable(float3, bg_color, , );
 
 struct PerRayData_radiance
@@ -41,5 +42,11 @@ rtDeclareVariable(PerRayData_radiance, prd_radiance, rtPayload, );
 
 RT_PROGRAM void miss()
 {
-  prd_radiance.result = bg_color;
+    const float3 dir = ray.direction;
+    const float x = 0.5f * (dir.y + 1);
+
+    const float3 color1 = make_float3(0.984, 0.761, 0.922);
+    const float3 color2 = make_float3(0.651, 0.757, 0.933);
+
+    prd_radiance.result = color1 * (1 - x) + color2 * x;// bg_color;
 }

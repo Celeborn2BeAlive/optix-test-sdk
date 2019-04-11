@@ -112,6 +112,7 @@ int  mouse_button;
 Material phong_matl;
 Material tex_matl;
 Material checker_matl;
+Material checker_pbr_matl;
 Material normal_matl;
 Material bary_matl;
 
@@ -342,9 +343,9 @@ void createContext()
     context->setMaxTraceDepth( 12 );
 
     // Note: high max depth for reflection and refraction through glass
-    context["max_depth"]->setInt( 10 );
+    context["max_depth"]->setInt( 4 );
     context["frame"]->setUint( 0u );
-    context["scene_epsilon"]->setFloat( 1.e-1f );
+    context["scene_epsilon"]->setFloat( 1.e-3f );
     context["ambient_light_color"]->setFloat( 0.4f, 0.4f, 0.4f );
 
     Buffer buffer = sutil::createOutputBuffer( context, RT_FORMAT_UNSIGNED_BYTE4, width, height, use_pbo );
@@ -433,6 +434,25 @@ void createMaterials()
     checker_matl["phong_exp2"]->setFloat( 0.0f );
     checker_matl["Kr1"]->setFloat(0.5f, 0.5f, 0.5f);
     checker_matl["Kr2"]->setFloat( 0.0f, 0.0f, 0.0f );
+
+    // Checker PBR material
+    ptx = sutil::getPtxString(SAMPLE_NAME, "checker_pbr.cu");
+    Program check_pbr_ch = context->createProgramFromPTXString(ptx, "closest_hit_radiance");
+    Program check_pbr_ah = context->createProgramFromPTXString(ptx, "any_hit_shadow");
+
+    checker_pbr_matl = context->createMaterial();
+    checker_pbr_matl->setClosestHitProgram(0, check_pbr_ch);
+    checker_pbr_matl->setAnyHitProgram(1, check_pbr_ah);
+
+    checker_pbr_matl["baseColor1"]->setFloat(0.5f, 0.9f, 0.4f);
+    checker_pbr_matl["emission1"]->setFloat(0.f, 0.f, 0.f);
+    checker_pbr_matl["roughness1"]->setFloat(0.0f);
+    checker_pbr_matl["metallic1"]->setFloat(0.0f);
+    checker_pbr_matl["baseColor2"]->setFloat(0.f, 0.f, 0.f);
+    checker_pbr_matl["emission2"]->setFloat(0.f, 0.f, 0.f);
+    checker_pbr_matl["roughness2"]->setFloat(0.1f);
+    checker_pbr_matl["metallic2"]->setFloat(0.0f);
+    checker_pbr_matl["inv_checker_size"]->setFloat(16.0f, 16.0f, 1.0f);
 
     // Barycentric material
     ptx             = sutil::getPtxString( SAMPLE_NAME, "optixGeometryTriangles.cu" );
@@ -579,7 +599,7 @@ GeometryGroup createGround(float groundHeight = 0)
     parallelogram["anchor"]->setFloat(anchor);
 
     // Greate GIs to bind Materials to the Geometry objects.
-    plane_gi = context->createGeometryInstance(parallelogram, &checker_matl, &checker_matl + 1);
+    plane_gi = context->createGeometryInstance(parallelogram, &checker_pbr_matl, &checker_pbr_matl + 1);
 
     // Create a GeometryGroup for the non-GeometryTriangles objects.
     GeometryGroup gg = context->createGeometryGroup();
@@ -1318,8 +1338,10 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
         std::clog << "[GLTF] Load " << gltfScene.nodes.size() << " nodes. \n";
         for (const auto & nodeIndex : gltfScene.nodes)
         {
+            const auto & node = model.nodes[nodeIndex];
+
             std::vector<GltfInstance> toImportInstances;
-            recursivelyFindInstances(model, model.nodes[nodeIndex], M44f::identity(), toImportInstances);
+            recursivelyFindInstances(model, node, M44f::identity(), toImportInstances);
             std::clog << "[GLTF] Load " << toImportInstances.size() << " instances for node " << nodeIndex << ". \n";
             for (const auto & gltfInst : toImportInstances)
             {
@@ -1690,6 +1712,30 @@ void glutMouseMotion( int x, int y)
         //const auto camera_left = optix::cross(rotated_3, camera_up);
         //const auto rotated_again = M44f::rotate(b.y - a.y, camera_left) * make_float4(v2.x, v2.y, v2.z, 0);
         //camera_eye = camera_lookat + make_float3(rotated_again.x, rotated_again.y, rotated_again.z);
+
+        camera_dirty = true;
+    }
+    else if (mouse_button == GLUT_MIDDLE_BUTTON)
+    {
+        const float dx = static_cast<float>(x - mouse_prev_pos.x) /
+            static_cast<float>(width);
+        const float dy = static_cast<float>(y - mouse_prev_pos.y) /
+            static_cast<float>(height);
+
+        float3 cam_eye;
+        float3 cam_up;
+        computeCameraVectors(cam_eye, cam_up);
+
+        const float vfov = 30.0f;
+        const float aspect_ratio = static_cast<float>(width) /
+            static_cast<float>(height);
+
+        float3 camera_u, camera_v, camera_w;
+        sutil::calculateCameraVariables(
+            cam_eye, camera_lookat, cam_up, vfov, aspect_ratio,
+            camera_u, camera_v, camera_w, /*fov_is_vertical*/ true);
+
+        camera_lookat += -dx * camera_u + dy * camera_v;
 
         camera_dirty = true;
     }

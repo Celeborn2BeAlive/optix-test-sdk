@@ -92,6 +92,8 @@ float3 cook_torrance_contrib(
 {
     // This is the contribution when using importance sampling with the GGX based
     // sample distribution. This means ct_contrib = ct_brdf / ggx_probability
+    // #c2ba note: ndl is the cosTheta of the integral, it has nothing to do with the brdf.
+    // #c2ba npte: if you multiply with ggx_probability you obtain the brdf, which is F * D * vis / 4 (D and 4 are contained in the pdf, the other factors cancel)
     return fresnel(vdh, Ks) * (visibility(ndl, ndv, Roughness) * vdh * ndl / ndh);
 }
 
@@ -163,7 +165,7 @@ __device__ void pbrMetallicRoughnessShade(
 
     const float3 V = -ray.direction;
     const float NdotV = optix::clamp(optix::dot(p_normal, V), 0.f, 1.f);
-    const float NdotV2 = NdotV * NdotV;
+    //const float NdotV2 = NdotV * NdotV;
     const float alpha = roughness * roughness;
     const float alpha2 = alpha * alpha;
     const float oneMinusAlpha2 = 1 - alpha2;
@@ -173,16 +175,6 @@ __device__ void pbrMetallicRoughnessShade(
     const float3 diffuse = c_diff * M_1_PIf;
 
     float3 result = emission;
-
-    // Constant environment
-    {
-        {
-            // Sample diffuse
-            const float2 Xi = make_float2(rnd(prd.seed), rnd(prd.seed));
-            float pdf = 0.f;
-            const float3 L = sampleCosineLobe(Xi, tangent, bitangent, p_normal, pdf);
-        }
-    }
 
     // Directional lights
     unsigned int num_lights = lights.size();
@@ -216,20 +208,18 @@ __device__ void pbrMetallicRoughnessShade(
         slickFactor *= slickFactor; // ^4
         slickFactor *= baseSlickFactor; // ^5
 
-        const float3 F = specularColor + (1 - specularColor) * slickFactor; // Fresnel Schlick
-
-        const float3 f_diffuse = optix::clamp(1 - F, 0.f, 1.f) * diffuse;
-
-        const float NdotL2 = NdotL * NdotL;
-
         // Smith Joint GGX
         //const float vis = 0.5f / (NdotL * sqrt(NdotV2 * oneMinusAlpha2 + alpha2) + NdotV * sqrt(NdotL2 * oneMinusAlpha2 + alpha2)); // glTF specification version
-        const float vis = 0.25f * G1(NdotL, alpha2) * G1(NdotV, alpha2) / 4.f; // substance version
+        const float vis = 0.25f * G1(NdotL, alpha2) * G1(NdotV, alpha2); // substance version
 
         const float Ddenom = (NdotH2 * (-oneMinusAlpha2) + 1);
         const float D = Ddenom > 0.f ? alpha2 * M_1_PIf / (Ddenom * Ddenom) : 0.f; // Trowbridge-Reitz
 
+        // const float3 F = specularColor + (1 - specularColor) * slickFactor; // Fresnel Schlick
+        const float3 F = fresnel(VdotH, specularColor);
+
         const float3 f_specular = (F * vis * D);
+        const float3 f_diffuse = optix::clamp(1 - F, 0.f, 1.f) * diffuse;
 
         const float horizonFade = 1.3;
         float fade = horizonFading(optix::dot(p_normal, L), horizonFade);
@@ -238,27 +228,92 @@ __device__ void pbrMetallicRoughnessShade(
 
         //result += (f_diffuse + f_specular) * Lc * NdotL;
         //result += fresnel(VdotH, specularColor) * (visibility(NdotL, NdotV, roughness) * VdotH * NdotL / NdotH);
-        result += use_substance_fresnel ? 
-            cook_torrance_contrib(VdotH, NdotH, NdotL, NdotV, specularColor, roughness) * probabilityGGX(NdotH, VdotH, roughness):
-            f_specular * NdotL;
-        //result +=  cook_torrance_contrib(VdotH, NdotH, NdotL, NdotV, specularColor, roughness) * probabilityGGX(NdotH, VdotH, roughness);
+
+        // Substance style:
+        result += f_diffuse * NdotL * Lc;
+        result += cook_torrance_contrib(VdotH, NdotH, NdotL, NdotV, specularColor, roughness) * probabilityGGX(NdotH, VdotH, roughness) * Lc;
     }
 
-    //if (fmaxf(p_Kr) > 0) {
 
-    //    // ray tree attenuation
-    //    PerRayData_radiance new_prd;
-    //    new_prd.importance = prd.importance * optix::luminance(p_Kr);
-    //    new_prd.depth = prd.depth + 1;
 
-    //    // reflection ray
-    //    if (new_prd.importance >= 0.01f && new_prd.depth <= max_depth) {
-    //        float3 R = optix::reflect(ray.direction, p_normal);
-    //        optix::Ray refl_ray = optix::make_Ray(hit_point, R, RADIANCE_RAY_TYPE, scene_epsilon, RT_DEFAULT_MAX);
-    //        rtTrace(top_object, refl_ray, new_prd);
-    //        result += p_Kr * new_prd.result;
-    //    }
-    //}
+    if (fmaxf(specularColor) > 0) 
+    {
+        // diffuse reflection
+        {
+            PerRayData_radiance new_prd;
+            new_prd.importance = prd.importance * optix::luminance(diffuse);
+            new_prd.depth = prd.depth + 1;
+
+            if (new_prd.importance >= 0.01f && new_prd.depth <= max_depth)
+            {
+                const float2 Xi = make_float2(rnd(prd.seed), rnd(prd.seed));
+                float pdf = 0.f;
+                const float3 R = sampleCosineLobe(Xi, tangent, bitangent, p_normal, pdf);
+
+                if (pdf > 0.f)
+                {
+                    optix::Ray refl_ray = optix::make_Ray(hit_point, R, RADIANCE_RAY_TYPE, scene_epsilon, RT_DEFAULT_MAX);
+                    rtTrace(top_object, refl_ray, new_prd);
+
+                    const float3 H = optix::normalize(V + R);
+
+                    const float VdotH = optix::clamp(optix::dot(V, H), 0.f, 1.f);
+
+                    const float3 F = fresnel(VdotH, specularColor);
+                    const float3 f_diffuse = optix::clamp(1 - F, 0.f, 1.f) * diffuse;
+                    result += f_diffuse * M_PIf * new_prd.result; // cancel NdotR and add Pi again by dividing with de pdf
+                }
+            }
+        }
+
+        // specular reflection
+        {
+            PerRayData_radiance new_prd;
+            new_prd.importance = prd.importance * optix::luminance(specularColor);
+            new_prd.depth = prd.depth + 1;
+
+            if (new_prd.importance >= 0.01f && new_prd.depth <= max_depth)
+            {
+                if (roughness > 0.f)
+                {
+                    const float2 Xi = make_float2(rnd(prd.seed), rnd(prd.seed));
+                    const float3 H = importanceSampleGGX(Xi, tangent, bitangent, p_normal, roughness);
+                    const float3 R = optix::reflect(ray.direction, H);
+
+                    const float VdotH = optix::clamp(optix::dot(V, H), 0.f, 1.f);
+                    const float NdotH = optix::clamp(optix::dot(p_normal, H), 0.f, 1.f);
+
+                    const float ggxPdf = probabilityGGX(NdotH, VdotH, roughness);
+
+                    if (ggxPdf > 0.005f)
+                    {
+                        optix::Ray refl_ray = optix::make_Ray(hit_point, R, RADIANCE_RAY_TYPE, scene_epsilon, RT_DEFAULT_MAX);
+                        rtTrace(top_object, refl_ray, new_prd);
+
+                        const float3 F = fresnel(VdotH, specularColor);
+                        const float3 f_diffuse = optix::clamp(1 - F, 0.f, 1.f) * diffuse;
+                        const float NdotR = optix::clamp(optix::dot(p_normal, R), 0.f, 1.f);
+
+                        result += cook_torrance_contrib(VdotH, NdotH, NdotR, NdotV, specularColor, roughness) * new_prd.result;
+                    }
+                }
+                else
+                {
+                    float3 R = optix::reflect(ray.direction, p_normal);
+                    optix::Ray refl_ray = optix::make_Ray(hit_point, R, RADIANCE_RAY_TYPE, scene_epsilon, RT_DEFAULT_MAX);
+                    rtTrace(top_object, refl_ray, new_prd);
+
+                    const float3 H = p_normal;
+                    const float VdotH = optix::clamp(optix::dot(V, H), 0.f, 1.f);
+
+                    const float3 F = fresnel(VdotH, specularColor);
+                    const float NdotR = optix::clamp(optix::dot(p_normal, R), 0.f, 1.f);
+
+                    result += F * NdotR * new_prd.result;
+                }
+            }
+        }
+    }
 
     // pass the color back up the tree
     prd.result = result;

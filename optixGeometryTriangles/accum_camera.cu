@@ -84,7 +84,9 @@ RT_PROGRAM void pinhole_camera()
   } else {
     acc_val = make_float4(prd.result, 0.f);
   }
-  output_buffer[launch_index] = make_color( make_float3( acc_val ) );
+  const float gamma = 2.2f;
+  const float gammaExponent = 1.f / gamma;
+  output_buffer[launch_index] = make_color(make_float3( pow(acc_val.x, gammaExponent), pow(acc_val.y, gammaExponent), pow(acc_val.z, gammaExponent) ));
   accum_buffer[launch_index] = acc_val;
 }
 
