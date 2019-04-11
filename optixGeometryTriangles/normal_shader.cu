@@ -32,6 +32,7 @@
 using namespace optix;
 
 rtDeclareVariable(float3, shading_normal, attribute shading_normal, ); 
+rtDeclareVariable(float3, shading_tangent, attribute shading_tangent, );
 
 struct PerRayData_radiance
 {
@@ -59,5 +60,5 @@ RT_PROGRAM void any_hit_shadow()
 
 RT_PROGRAM void closest_hit_radiance()
 {
-  prd_radiance.result = normalize(rtTransformNormal(RT_OBJECT_TO_WORLD, shading_normal))*0.5f + 0.5f;
+  prd_radiance.result = normalize(rtTransformNormal(RT_OBJECT_TO_WORLD, shading_tangent))*0.5f + 0.5f;
 }

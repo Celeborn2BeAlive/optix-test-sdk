@@ -80,8 +80,7 @@ __device__ void phongShade( float3 p_Kd,
   unsigned int num_lights = lights.size();
   for(int i = 0; i < num_lights; ++i) {
     BasicLight light = lights[i];
-    float Ldist = optix::length(light.pos - hit_point);
-    float3 L = optix::normalize(light.pos - hit_point);
+    float3 L = light.dir;
     float nDl = optix::dot( p_normal, L);
 
     // cast shadow ray
@@ -89,7 +88,7 @@ __device__ void phongShade( float3 p_Kd,
     if ( nDl > 0.0f && light.casts_shadow ) {
       PerRayData_shadow shadow_prd;
       shadow_prd.attenuation = make_float3(1.0f);
-      optix::Ray shadow_ray = optix::make_Ray( hit_point, L, SHADOW_RAY_TYPE, scene_epsilon, Ldist );
+      optix::Ray shadow_ray = optix::make_Ray( hit_point, L, SHADOW_RAY_TYPE, scene_epsilon, RT_DEFAULT_MAX );
       rtTrace(top_shadower, shadow_ray, shadow_prd);
       light_attenuation = shadow_prd.attenuation;
     }
@@ -98,7 +97,7 @@ __device__ void phongShade( float3 p_Kd,
     if( fmaxf(light_attenuation) > 0.0f ) {
       float3 Lc = light.color * light_attenuation;
 
-      result += p_Kd * nDl * Lc;
+      result += p_Kd * M_1_PIf * nDl * Lc;
 
       float3 H = optix::normalize(L - ray.direction);
       float nDh = optix::dot( p_normal, H );

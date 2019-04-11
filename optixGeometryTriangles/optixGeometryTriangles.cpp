@@ -90,6 +90,8 @@ float camera_phi = 0, camera_theta = 0;
 float camera_dist = 1.f;
 bool camera_dirty = true;
 
+bool use_substance_fresnel = false;
+
 void computeCameraVectors(float3 & camera_eye, float3 & camera_up)
 {
     const auto cos_theta = cos(camera_theta);
@@ -175,6 +177,16 @@ struct pbrMetalRoughnessMaterial
 
 std::vector<pbrMetalRoughnessMaterial> gltf_materials;
 
+std::vector<Buffer> gltf_optix_images;
+std::vector<TextureSampler> gltf_optix_textures;
+std::vector<Material> gltf_optix_materials;
+
+TextureSampler default_white_texture;
+TextureSampler default_normal_texture;
+
+Program pbrMetallicRoughnessAnyHitShadow;
+Program pbrMetallicRoughnessClosestHitRadiance;
+
 //------------------------------------------------------------------------------
 //
 // Forward decls
@@ -188,7 +200,7 @@ void createContext();
 void createMaterials();
 GeometryGroup createGeometry();
 GeometryGroup createGeometryTriangles();
-void setupScene();
+void setupScene(const std::string & input_gltf);
 void setupCamera();
 void setupLights();
 void updateCamera();
@@ -332,7 +344,7 @@ void createContext()
     // Note: high max depth for reflection and refraction through glass
     context["max_depth"]->setInt( 10 );
     context["frame"]->setUint( 0u );
-    context["scene_epsilon"]->setFloat( 1.e-4f );
+    context["scene_epsilon"]->setFloat( 1.e-1f );
     context["ambient_light_color"]->setFloat( 0.4f, 0.4f, 0.4f );
 
     Buffer buffer = sutil::createOutputBuffer( context, RT_FORMAT_UNSIGNED_BYTE4, width, height, use_pbo );
@@ -356,8 +368,12 @@ void createContext()
     // Miss program
     context->setMissProgram( 0, context->createProgramFromPTXString( sutil::getPtxString( SAMPLE_NAME, "constantbg.cu" ), "miss" ) );
     context["bg_color"]->setFloat( 0.34f, 0.55f, 0.85f );
+
+    context["use_substance_fresnel"]->setInt(use_substance_fresnel);
 }
 
+optix::TextureSampler createDefaultNormalTexture();
+optix::TextureSampler createDefaultWhiteTexture();
 
 void createMaterials()
 {
@@ -426,8 +442,56 @@ void createMaterials()
     bary_matl = context->createMaterial();
     bary_matl->setClosestHitProgram( 0, bary_ch );
     bary_matl->setAnyHitProgram( 1, bary_ah );
+
+    ptx = sutil::getPtxString(SAMPLE_NAME, "pbrMetallicRoughness.cu");
+
+    pbrMetallicRoughnessAnyHitShadow = context->createProgramFromPTXString(ptx, "any_hit_shadow");
+    pbrMetallicRoughnessClosestHitRadiance = context->createProgramFromPTXString(ptx, "closest_hit_radiance");
+
+    default_normal_texture = createDefaultNormalTexture();
+    default_white_texture = createDefaultWhiteTexture();
 }
 
+optix::TextureSampler createOnePixelTexture(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    optix::TextureSampler sampler = context->createTextureSampler();
+
+    sampler->setWrapMode(0, RT_WRAP_CLAMP_TO_EDGE);
+    sampler->setWrapMode(1, RT_WRAP_CLAMP_TO_EDGE);
+    sampler->setWrapMode(2, RT_WRAP_CLAMP_TO_EDGE);
+
+    sampler->setFilteringModes(RT_FILTER_NEAREST, RT_FILTER_NEAREST, RT_FILTER_NEAREST);
+
+    sampler->setIndexingMode(RT_TEXTURE_INDEX_NORMALIZED_COORDINATES);
+    sampler->setReadMode(RT_TEXTURE_READ_NORMALIZED_FLOAT);
+    sampler->setMaxAnisotropy(1.0f);
+    sampler->setMipLevelCount(1u);
+    sampler->setArraySize(1u);
+
+    optix::Buffer buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_UNSIGNED_BYTE4, 1, 1);
+    uint8_t* buffer_data = static_cast<uint8_t*>(buffer->map());
+
+    buffer_data[0] = r;
+    buffer_data[1] = g;
+    buffer_data[2] = b;
+    buffer_data[3] = a;
+
+    buffer->unmap();
+
+    sampler->setBuffer(buffer);
+
+    return sampler;
+}
+
+optix::TextureSampler createDefaultNormalTexture()
+{
+    return createOnePixelTexture(0, 0, 255, 255);
+}
+
+optix::TextureSampler createDefaultWhiteTexture()
+{
+    return createOnePixelTexture(255, 255, 255, 255);
+}
 
 GeometryGroup createGeometryTriangles()
 {
@@ -763,6 +827,89 @@ const T get(const tinygltf::Parameter & param, const std::string & name, T defau
     return defaultValue;
 }
 
+optix::Buffer createTextureImageBuffer(const tinygltf::Image & image)
+{
+    assert(image.component == 4);
+
+    const unsigned int nx = image.width;
+    const unsigned int ny = image.height;
+
+    optix::Buffer buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_UNSIGNED_BYTE4, nx, ny);
+    uint8_t* buffer_data = static_cast<uint8_t*>(buffer->map());
+
+    std::copy(begin(image.image), end(image.image), buffer_data);
+
+    buffer->unmap();
+
+    return buffer;
+}
+
+optix::TextureSampler createDefaultTextureSampler(optix::Buffer imageBuffer)
+{
+    optix::TextureSampler sampler = context->createTextureSampler();
+    sampler->setWrapMode(0, RT_WRAP_REPEAT);
+    sampler->setWrapMode(1, RT_WRAP_REPEAT);
+    sampler->setWrapMode(2, RT_WRAP_REPEAT);
+
+    sampler->setFilteringModes(RT_FILTER_LINEAR, RT_FILTER_LINEAR, RT_FILTER_LINEAR);
+
+    sampler->setIndexingMode(RT_TEXTURE_INDEX_NORMALIZED_COORDINATES);
+    sampler->setReadMode(RT_TEXTURE_READ_NORMALIZED_FLOAT);
+    sampler->setMaxAnisotropy(1.0f);
+    sampler->setMipLevelCount(1u);
+    sampler->setArraySize(1u);
+
+    sampler->setBuffer(imageBuffer);
+
+    return sampler;
+}
+
+optix::TextureSampler createTextureSampler(const tinygltf::Sampler & gltfSampler, optix::Buffer imageBuffer)
+{
+    static const std::unordered_map<int, RTwrapmode> wrapMap{
+        { TINYGLTF_TEXTURE_WRAP_REPEAT, RT_WRAP_REPEAT },
+        { TINYGLTF_TEXTURE_WRAP_CLAMP_TO_EDGE, RT_WRAP_CLAMP_TO_EDGE },
+        { TINYGLTF_TEXTURE_WRAP_MIRRORED_REPEAT, RT_WRAP_MIRROR }
+    };
+
+    optix::TextureSampler sampler = context->createTextureSampler();
+    sampler->setWrapMode(0, wrapMap.at(gltfSampler.wrapS));
+    sampler->setWrapMode(1, wrapMap.at(gltfSampler.wrapT));
+    sampler->setWrapMode(2, wrapMap.at(gltfSampler.wrapR));
+
+    const RTfiltermode minFilter = [&gltfSampler]()
+    {
+        if (gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST || gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST
+            || gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR)
+            return RT_FILTER_NEAREST;
+        return RT_FILTER_LINEAR;
+    }();
+    const RTfiltermode magFilter = (gltfSampler.magFilter == TINYGLTF_TEXTURE_FILTER_NEAREST) ? RT_FILTER_NEAREST : RT_FILTER_LINEAR;
+    const RTfiltermode mipmapFilter = [&gltfSampler]()
+    {
+        if (gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST
+            || gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST)
+            return RT_FILTER_NEAREST;
+        else if (gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR
+            || gltfSampler.minFilter == TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR)
+            return RT_FILTER_LINEAR;
+        return RT_FILTER_NONE;
+    }();
+
+
+    sampler->setFilteringModes(minFilter, magFilter, mipmapFilter);
+
+    sampler->setIndexingMode(RT_TEXTURE_INDEX_NORMALIZED_COORDINATES);
+    sampler->setReadMode(RT_TEXTURE_READ_NORMALIZED_FLOAT);
+    sampler->setMaxAnisotropy(1.0f);
+    sampler->setMipLevelCount(1u);
+    sampler->setArraySize(1u);
+
+    sampler->setBuffer(imageBuffer);
+
+    return sampler;
+}
+
 pbrMetalRoughnessMaterial readMaterial(const tinygltf::Material & material)
 {
     pbrMetalRoughnessMaterial m;
@@ -839,6 +986,124 @@ pbrMetalRoughnessMaterial readMaterial(const tinygltf::Material & material)
     return m;
 }
 
+optix::Material toOptixMaterial(const pbrMetalRoughnessMaterial & material)
+{
+    optix::Material optixMaterial = context->createMaterial();
+
+    optixMaterial->setClosestHitProgram(0, pbrMetallicRoughnessClosestHitRadiance);
+    optixMaterial->setAnyHitProgram(1, pbrMetallicRoughnessAnyHitShadow);
+    optixMaterial["baseColorFactor"]->setFloat(material.baseColorFactor);
+    if (material.baseColorTextureIndex >= 0)
+        optixMaterial["baseColorTexture"]->setTextureSampler(gltf_optix_textures[material.baseColorTextureIndex]);
+    else
+        optixMaterial["baseColorTexture"]->setTextureSampler(default_white_texture);
+
+    optixMaterial["metallicFactor"]->setFloat(material.metallicFactor);
+    optixMaterial["roughnessFactor"]->setFloat(material.roughnessFactor);
+
+    if (material.metallicRoughnessTextureIndex >= 0)
+        optixMaterial["metallicRoughnessTexture"]->setTextureSampler(gltf_optix_textures[material.metallicRoughnessTextureIndex]);
+    else
+        optixMaterial["metallicRoughnessTexture"]->setTextureSampler(default_white_texture);
+
+    optixMaterial["emissiveFactor"]->setFloat(material.emissiveFactor);
+    if (material.emissiveTextureIndex >= 0)
+        optixMaterial["emissiveTexture"]->setTextureSampler(gltf_optix_textures[material.emissiveTextureIndex]);
+    else
+        optixMaterial["emissiveTexture"]->setTextureSampler(default_white_texture);
+
+    optixMaterial["normalScale"]->setFloat(material.normalTextureScale);
+    if (material.normalTextureIndex >= 0)
+        optixMaterial["normalTexture"]->setTextureSampler(gltf_optix_textures[material.normalTextureIndex]);
+    else
+        optixMaterial["normalTexture"]->setTextureSampler(default_normal_texture);
+
+    return optixMaterial;
+}
+
+// Return buffer of float4, positionData should contain float3 and texcoordData float2
+// https://www.marti.works/calculating-tangents-for-your-mesh/
+std::vector<float> computeTangents(const std::vector<int32_t> & indexBuffer, const std::vector<float> & positionBuffer, const std::vector<float> & normalBuffer,
+    const std::vector<float> & texcoordBuffer)
+{
+    const auto triangleCount = indexBuffer.size() / 3;
+
+    const auto  vtxCount = positionBuffer.size() / 3;
+    assert((texcoordBuffer.size() / 2) == vtxCount);
+    assert((normalBuffer.size() / 3) == vtxCount);
+
+    std::vector<float3> tanA(vtxCount, make_float3(0.f));
+    std::vector<float3> tanB(vtxCount, make_float3(0.f));
+
+    const auto  indexCount = indexBuffer.size();
+    for (size_t i = 0; i < triangleCount; ++i) {
+        const auto baseIdx = i * 3;
+        const auto i0 = indexBuffer[baseIdx + 0];
+        const auto i1 = indexBuffer[baseIdx + 1];
+        const auto i2 = indexBuffer[baseIdx + 2];
+
+        const auto pos0 = make_float3(positionBuffer[i0 * 3 + 0], positionBuffer[i0 * 3 + 1], positionBuffer[i0 * 3 + 2]);
+        const auto pos1 = make_float3(positionBuffer[i1 * 3 + 0], positionBuffer[i1 * 3 + 1], positionBuffer[i1 * 3 + 2]);
+        const auto pos2 = make_float3(positionBuffer[i2 * 3 + 0], positionBuffer[i2 * 3 + 1], positionBuffer[i2 * 3 + 2]);
+
+        const auto tex0 = make_float2(texcoordBuffer[i0 * 2 + 0], texcoordBuffer[i0 * 2 + 1]);
+        const auto tex1 = make_float2(texcoordBuffer[i1 * 2 + 0], texcoordBuffer[i1 * 2 + 1]);
+        const auto tex2 = make_float2(texcoordBuffer[i2 * 2 + 0], texcoordBuffer[i2 * 2 + 1]);
+
+        const auto edge1 = pos1 - pos0;
+        const auto edge2 = pos2 - pos0;
+
+        const auto uv1 = tex1 - tex0;
+        const auto uv2 = tex2 - tex0;
+
+        float r = 1.0f / (uv1.x * uv2.y - uv1.y * uv2.x);
+
+        const auto tangent = make_float3(
+            ((edge1.x * uv2.y) - (edge2.x * uv1.y)) * r,
+            ((edge1.y * uv2.y) - (edge2.y * uv1.y)) * r,
+            ((edge1.z * uv2.y) - (edge2.z * uv1.y)) * r
+        );
+
+        const auto bitangent = make_float3(
+            ((edge1.x * uv2.x) - (edge2.x * uv1.x)) * r,
+            ((edge1.y * uv2.x) - (edge2.y * uv1.x)) * r,
+            ((edge1.z * uv2.x) - (edge2.z * uv1.x)) * r
+        );
+
+
+        tanA[i0] += tangent;
+        tanA[i1] += tangent;
+        tanA[i2] += tangent;
+
+        tanB[i0] += bitangent;
+        tanB[i1] += bitangent;
+        tanB[i2] += bitangent;
+    }
+
+    std::vector<float> tangents(4 * vtxCount);
+
+    for (size_t i = 0; i < vtxCount; i++) {
+        const auto n = make_float3(normalBuffer[i * 3 + 0], normalBuffer[i * 3 + 1], normalBuffer[i * 3 + 2]);
+
+        const auto  t0 = tanA[i];
+        const auto  t1 = tanB[i];
+
+        const auto t = normalize(t0 - (n * dot(n, t0)));
+
+        const auto c = cross(n, t0);
+        float w = (dot(c, t1) < 0) ? -1.0f : 1.0f;
+
+        auto * tangent = tangents.data() + i * 4;
+
+        tangent[0] = t.x;
+        tangent[1] = t.y;
+        tangent[2] = t.z;
+        tangent[3] = w;
+    }
+
+    return tangents;
+}
+
 std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
 {
     tinygltf::Model model;
@@ -861,10 +1126,33 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
         throw std::runtime_error(msg);
     }
 
+    for (size_t imageIdx = 0; imageIdx < model.images.size(); ++imageIdx)
+    {
+        const auto & image = model.images[imageIdx];
+        gltf_optix_images.emplace_back(createTextureImageBuffer(image));
+    }
+
+    for (size_t textureIdx = 0; textureIdx < model.textures.size(); ++textureIdx)
+    {
+        const auto & texture = model.textures[textureIdx];
+        const auto imageBuffer = gltf_optix_images[texture.source];
+
+        if (texture.sampler >= 0)
+        {
+            const auto & sampler = model.samplers[texture.sampler];
+            gltf_optix_textures.emplace_back(createTextureSampler(sampler, imageBuffer));
+        }
+        else
+        {
+            gltf_optix_textures.emplace_back(createDefaultTextureSampler(imageBuffer));
+        }
+    }
+
     for (size_t materialIdx = 0; materialIdx < model.materials.size(); ++materialIdx)
     {
         const auto & material = model.materials[materialIdx];
         gltf_materials.emplace_back(readMaterial(material));
+        gltf_optix_materials.emplace_back(toOptixMaterial(gltf_materials.back()));
     }
 
     std::vector<GeometryTriangles> geometries;
@@ -952,10 +1240,26 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
                 return loadGltfBuffer<float, 2>(texcoordIndex, "texcoord", model, texcoordData);
             }();
 
+            std::vector<float> tangentData;
+            const size_t tangentCount = [&]() -> size_t {
+                const size_t index = findVertexAttributeIndex(prim, "TANGENT");
+                if (index == -1)
+                {
+                    if (texcoordCount > 0)
+                    {
+                        tangentData = computeTangents(indexBuffer, positionData, normalData, texcoordData);
+                        return tangentData.size();
+                    }
+                    return 0;
+                }
+                return loadGltfBuffer<float, 4>(index, "tangents", model, tangentData);
+            }();
+
             // Create Buffers for the triangle vertices, normals, texture coordinates, and indices.
             Buffer vertex_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT3, positionCount);
             Buffer normal_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT3, normalCount);
             Buffer texcoord_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT2, texcoordCount);
+            Buffer tangent_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_FLOAT4, tangentCount);
             Buffer index_buffer = context->createBuffer(RT_BUFFER_INPUT, RT_FORMAT_UNSIGNED_INT3, triangleCount);
 
             // Copy the tetrahedron geometry into the device Buffers.
@@ -963,12 +1267,16 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
             memcpy(normal_buffer->map(), normalData.data(), normalData.size() * sizeof(normalData[0]));
             if (texcoordCount > 0)
                 memcpy(texcoord_buffer->map(), texcoordData.data(), texcoordData.size() * sizeof(texcoordData[0]));
+            if (tangentCount > 0)
+                memcpy(tangent_buffer->map(), tangentData.data(), tangentData.size() * sizeof(tangentData[0]));
             memcpy(index_buffer->map(), indexBuffer.data(), indexBuffer.size() * sizeof(indexBuffer[0]));
 
             vertex_buffer->unmap();
             normal_buffer->unmap();
             if (texcoordCount > 0)
                 texcoord_buffer->unmap();
+            if (tangentCount > 0)
+                tangent_buffer->unmap();
             index_buffer->unmap();
 
             // Create a GeometryTriangles object.
@@ -989,6 +1297,7 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
             geom_tri["vertex_buffer"]->setBuffer(vertex_buffer);
             geom_tri["normal_buffer"]->setBuffer(normal_buffer);
             geom_tri["texcoord_buffer"]->setBuffer(texcoord_buffer);
+            geom_tri["tangent_buffer"]->setBuffer(tangent_buffer);
 
             geometry = geom_tri;
         }
@@ -1040,7 +1349,7 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
                     GeometryGroup gg = context->createGeometryGroup();
                     gg->setAcceleration(meshToAccel[geomIdx]);
 
-                    GeometryInstance gi = context->createGeometryInstance(geometries[geomIdx], phong_matl);
+                    GeometryInstance gi = context->createGeometryInstance(geometries[geomIdx], gltf_optix_materials[prim.material]);
                     gg->addChild(gi);
 
                     Transform transform = context->createTransform();
@@ -1120,7 +1429,6 @@ void setupScene(const std::string & input_gltf)
     context["top_shadower"]->set( top_group );
 }
 
-
 void setupCamera()
 {
     const auto bboxDiag = bboxMax - bboxMin;
@@ -1140,7 +1448,7 @@ void setupCamera()
 
     camera_theta = atan2(sin_theta, cos_theta);
     camera_phi = atan2(sin_phi, cos_phi);
-
+    
     camera_theta = M_PI_4f;
     camera_phi = M_PI_4f;
 
@@ -1153,12 +1461,12 @@ void setupCamera()
     camera_dirty  = true;
 }
 
-
 void setupLights()
 {
+    const auto bboxDiag = bboxMax - bboxMin;
 
     BasicLight lights[] = {
-        { make_float3( 60.0f, 40.0f, 0.0f ), make_float3( 1.0f, 1.0f, 1.0f ), 1 }
+        { optix::normalize(make_float3(0,1,1)), make_float3( 2.0f, 2.0f, 2.0f ), 1 }
     };
 
     Buffer light_buffer = context->createBuffer( RT_BUFFER_INPUT );
@@ -1170,7 +1478,6 @@ void setupLights()
 
     context[ "lights" ]->set( light_buffer );
 }
-
 
 void updateCamera()
 {
@@ -1193,23 +1500,6 @@ void updateCamera()
             normalize( -camera_w ),
             camera_lookat);
 
-
-
-    //const Matrix4x4 frame_inv = frame.inverse();
-
-    //// Apply camera rotation twice to match old SDK behavior
-    //const Matrix4x4 trans   = frame*camera_rotate*frame_inv;
-
-    //camera_eye    = make_float3( trans*make_float4( camera_eye,    1.0f ) );
-    //camera_lookat = make_float3( trans*make_float4( camera_lookat, 1.0f ) );
-    //camera_up     = make_float3( trans*make_float4( camera_up,     0.0f ) );
-
-    //sutil::calculateCameraVariables(
-    //        camera_eye, camera_lookat, camera_up, vfov, aspect_ratio,
-    //        camera_u, camera_v, camera_w, true );
-
-    //camera_rotate = Matrix4x4::identity();
-
     context["eye"]->setFloat(cam_eye);
     context["U"  ]->setFloat( camera_u );
     context["V"  ]->setFloat( camera_v );
@@ -1217,7 +1507,6 @@ void updateCamera()
 
     camera_dirty = false;
 }
-
 
 void glutInitialize( int* argc, char** argv )
 {
@@ -1228,7 +1517,6 @@ void glutInitialize( int* argc, char** argv )
     glutCreateWindow( SAMPLE_NAME );
     glutHideWindow();
 }
-
 
 void glutRun()
 {
@@ -1255,7 +1543,6 @@ void glutRun()
 
     glutMainLoop();
 }
-
 
 //------------------------------------------------------------------------------
 //
@@ -1295,6 +1582,14 @@ void glutKeyboardPress( unsigned char k, int x, int y )
         }
     };
 
+    const auto setInstanceMaterial = [&]()
+    {
+        for (size_t i = 0; i < gltf_instances.size(); ++i)
+        {
+            gltf_instances[i].gi->setMaterial(0, gltf_optix_materials[i]);
+        }
+    };
+
     switch( k )
     {
         case( 'm' ):
@@ -1313,6 +1608,13 @@ void glutKeyboardPress( unsigned char k, int x, int y )
                 setMaterial(phong_matl);
 
             count %= 5;
+            camera_dirty = true;
+            break;
+        }
+        case ( 'f' ):
+        {
+            use_substance_fresnel = !use_substance_fresnel;
+            context["use_substance_fresnel"]->setInt(use_substance_fresnel);
             camera_dirty = true;
             break;
         }

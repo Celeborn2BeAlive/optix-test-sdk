@@ -32,13 +32,26 @@
 
 rtDeclareVariable( float3, shading_normal,   attribute shading_normal, );
 rtDeclareVariable( float3, geometric_normal, attribute geometric_normal, );
+rtDeclareVariable(float3, shading_tangent, attribute shading_tangent, );
+rtDeclareVariable(float3, shading_bitangent, attribute shading_bitangent, );
 rtDeclareVariable( float3, texcoord,         attribute texcoord, );
 rtDeclareVariable( float2, barycentrics,     attribute barycentrics, );
 
 rtBuffer<float3> vertex_buffer;
 rtBuffer<float3> normal_buffer;
+rtBuffer<float4> tangent_buffer;
 rtBuffer<float2> texcoord_buffer;
 rtBuffer<int3>   index_buffer;
+
+// Building an orthonormal basis, Revisited [Duff et al. 2017]
+void branchlessONB(const float3 & n, float3 & b1, float3 & b2)
+{
+    float sign = copysignf(1.0f, n.z);
+    const float a = -1.f / (sign + n.z);
+    const float b = n.x * n.y * a;
+    b1 = make_float3(1.f + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    b2 = make_float3(b, sign + n.y * n.y * a, -n.y);
+}
 
 RT_PROGRAM void triangle_attributes()
 {
@@ -61,6 +74,20 @@ RT_PROGRAM void triangle_attributes()
     {
         shading_normal = normal_buffer[v_idx.y] * barycentrics.x + normal_buffer[v_idx.z] * barycentrics.y
             + normal_buffer[v_idx.x] * ( 1.0f-barycentrics.x-barycentrics.y );
+    }
+
+    if (tangent_buffer.size() == 0)
+    {
+        branchlessONB(shading_normal, shading_tangent, shading_bitangent);
+    }
+    else
+    {
+        float4 tB = tangent_buffer[v_idx.y];
+        float4 tC = tangent_buffer[v_idx.z];
+        float4 tA = tangent_buffer[v_idx.x];
+
+        shading_tangent = make_float3(tB) * barycentrics.x + make_float3(tC) * barycentrics.y + make_float3(tA) * (1.0f - barycentrics.x - barycentrics.y);
+        shading_bitangent = optix::cross(shading_normal, shading_tangent) * tA.w;
     }
 
     if( texcoord_buffer.size() == 0 )
