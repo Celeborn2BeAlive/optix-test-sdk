@@ -76,7 +76,7 @@ RT_PROGRAM void closest_hit_radiance()
                       static_cast<int>( t.y ) +
                       static_cast<int>( t.z ) ) & 1;
 
-  if ( which_check ) {
+  if ( !which_check ) {
       baseColor = baseColor1; emission = emission1; metallic = metallic1; roughness = roughness1;
   } else {
       baseColor = baseColor2; emission = emission2; metallic = metallic2; roughness = roughness2;

@@ -78,12 +78,15 @@ RT_PROGRAM void pinhole_camera()
 
   rtTrace(top_object, ray, prd);
 
+  prd.result = optix::clamp(prd.result, make_float3(0.0), make_float3(1.5));
+
   float4 acc_val = accum_buffer[launch_index];
   if( frame > 0 ) {
     acc_val = lerp( acc_val, make_float4( prd.result, 0.f), 1.0f / static_cast<float>( frame+1 ) );
   } else {
     acc_val = make_float4(prd.result, 0.f);
   }
+
   const float gamma = 2.2f;
   const float gammaExponent = 1.f / gamma;
   output_buffer[launch_index] = make_color(make_float3( pow(acc_val.x, gammaExponent), pow(acc_val.y, gammaExponent), pow(acc_val.z, gammaExponent) ));

@@ -72,6 +72,10 @@ const char* const SAMPLE_NAME = "optixGeometryTriangles";
 //
 //------------------------------------------------------------------------------
 
+std::vector<std::string> gltf_files = {
+};
+int current_gltf_file = 0;
+
 Context  context;
 uint32_t width   = 768u;
 uint32_t height  = 768u;
@@ -583,9 +587,11 @@ GeometryGroup createGround(float groundHeight = 0)
     parallelogram->setBoundingBoxProgram(context->createProgramFromPTXString(ptx, "bounds"));
     parallelogram->setIntersectionProgram(context->createProgramFromPTXString(ptx, "intersect"));
 
-    float3 anchor = make_float3(-8.0f, groundHeight, -8.0f);
-    float3 v1 = make_float3(16.0f, 0.f, 0.0f);
-    float3 v2 = make_float3(0.0f, 0.f, 16.0f);
+    const auto bboxDiag = bboxMax - bboxMin;
+    const auto scale = 100;
+    float3 anchor = make_float3(bboxMin.x - scale * bboxDiag.x, groundHeight, bboxMin.z - scale * bboxDiag.z);
+    float3 v1 = make_float3(2 * scale * bboxDiag.x, 0.f, 0.0f);
+    float3 v2 = make_float3(0.0f, 0.f, 2 * scale * bboxDiag.z);
     float3 normal = normalize(cross(v1, v2));
 
     float d = dot(normal, anchor);
@@ -1427,6 +1433,15 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
 
 void setupScene(const std::string & input_gltf)
 {
+    gltf_instances.clear();
+    gltf_materials.clear();
+    gltf_optix_images.clear();
+    gltf_optix_textures.clear();
+    gltf_optix_materials.clear();
+
+    bboxMin = make_float3(std::numeric_limits<float>::max());
+    bboxMax = make_float3(std::numeric_limits<float>::lowest());
+
     // Create a GeometryGroup for the GeometryTriangles instances and a separate
     // GeometryGroup for all other primitives.
     GeometryGroup tri_gg = createGeometryTriangles();
@@ -1640,6 +1655,23 @@ void glutKeyboardPress( unsigned char k, int x, int y )
             camera_dirty = true;
             break;
         }
+        case ('n'):
+        {
+            current_gltf_file = (current_gltf_file + 1) % gltf_files.size();
+            setupScene(gltf_files[current_gltf_file]);
+            setupCamera();
+            break;
+        }
+        case ('b'):
+        {
+            if (current_gltf_file > 0)
+                current_gltf_file = (current_gltf_file - 1) % gltf_files.size();
+            else
+                current_gltf_file = gltf_files.size() - 1;
+            setupScene(gltf_files[current_gltf_file]);
+            setupCamera();
+            break;
+        }
         case( 'q' ):
         case( 27 ): // ESC
         {
@@ -1838,6 +1870,10 @@ int main( int argc, char** argv )
 
         createContext();
         createMaterials();
+
+        if (input_file.empty())
+            input_file = gltf_files[current_gltf_file];
+
         setupScene(input_file);
         setupCamera();
         setupLights();
