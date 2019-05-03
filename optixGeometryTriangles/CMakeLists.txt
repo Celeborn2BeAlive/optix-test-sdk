@@ -58,6 +58,7 @@ if(GLUT_FOUND AND OPENGL_FOUND)
         PRIVATE
         ${CMAKE_SOURCE_DIR}/third-party
     )
+
 else()
     # GLUT or OpenGL not found
     message("Disabling optixGeometryTriangles, which requires GLUT and OpenGL.")

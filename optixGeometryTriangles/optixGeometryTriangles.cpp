@@ -55,6 +55,8 @@
 #include <iostream>
 #include <stdint.h>
 
+#include <filesystem>
+
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -66,14 +68,15 @@ using namespace optix;
 
 const char* const SAMPLE_NAME = "optixGeometryTriangles";
 
+namespace fs = std::experimental::filesystem;
+
 //------------------------------------------------------------------------------
 //
 // Globals
 //
 //------------------------------------------------------------------------------
 
-std::vector<std::string> gltf_files = {
-};
+std::vector<fs::path> gltf_files;
 int current_gltf_file = 0;
 
 Context  context;
@@ -205,7 +208,7 @@ void createContext();
 void createMaterials();
 GeometryGroup createGeometry();
 GeometryGroup createGeometryTriangles();
-void setupScene(const std::string & input_gltf);
+void setupScene(size_t gltf_idx);
 void setupCamera();
 void setupLights();
 void updateCamera();
@@ -334,6 +337,17 @@ void registerExitHandler()
 }
 
 
+void clearFramebuffer()
+{
+    Buffer buffer = sutil::createOutputBuffer(context, RT_FORMAT_UNSIGNED_BYTE4, width, height, use_pbo);
+    context["output_buffer"]->set(buffer);
+
+    // Accumulation buffer.
+    Buffer accum_buffer = context->createBuffer(RT_BUFFER_INPUT_OUTPUT | RT_BUFFER_GPU_LOCAL,
+        RT_FORMAT_FLOAT4, width, height);
+    context["accum_buffer"]->set(accum_buffer);
+}
+
 void createContext()
 {
     int v = 1;
@@ -352,13 +366,7 @@ void createContext()
     context["scene_epsilon"]->setFloat( 1.e-3f );
     context["ambient_light_color"]->setFloat( 0.4f, 0.4f, 0.4f );
 
-    Buffer buffer = sutil::createOutputBuffer( context, RT_FORMAT_UNSIGNED_BYTE4, width, height, use_pbo );
-    context["output_buffer"]->set( buffer );
-
-    // Accumulation buffer.
-    Buffer accum_buffer = context->createBuffer( RT_BUFFER_INPUT_OUTPUT | RT_BUFFER_GPU_LOCAL,
-            RT_FORMAT_FLOAT4, width, height );
-    context["accum_buffer"]->set( accum_buffer );
+    clearFramebuffer();
 
     // Ray generation program
     const char *ptx = sutil::getPtxString( SAMPLE_NAME, "accum_camera.cu" );
@@ -1431,8 +1439,10 @@ std::vector<OptixInstance> createGLTFGeometry(const std::string & input_gltf)
     return instances;
 }
 
-void setupScene(const std::string & input_gltf)
+void setupScene(size_t gltf_idx)
 {
+    const auto input_gltf = gltf_files[gltf_idx].string();
+
     gltf_instances.clear();
     gltf_materials.clear();
     gltf_optix_images.clear();
@@ -1483,11 +1493,11 @@ void setupCamera()
     const auto cos_phi = cam_z.z / cos_theta;
     const auto sin_phi = cam_z.x / cos_theta;
 
-    camera_theta = atan2(sin_theta, cos_theta);
-    camera_phi = atan2(sin_phi, cos_phi);
+    camera_theta = atan2(sin_theta, cos_theta) * 2.f / 3.f;
+    camera_phi = atan2(sin_phi, cos_phi) * 2.f / 3.f;
     
-    camera_theta = M_PI_4f;
-    camera_phi = M_PI_4f;
+    //camera_theta = M_PI_4f;
+    //camera_phi = M_PI_4f;
 
     //camera_lookat = (bboxMax + bboxMin) * 0.5f;
     //camera_lookat.y = bboxMin.y;
@@ -1658,7 +1668,7 @@ void glutKeyboardPress( unsigned char k, int x, int y )
         case ('n'):
         {
             current_gltf_file = (current_gltf_file + 1) % gltf_files.size();
-            setupScene(gltf_files[current_gltf_file]);
+            setupScene(current_gltf_file);
             setupCamera();
             break;
         }
@@ -1668,7 +1678,7 @@ void glutKeyboardPress( unsigned char k, int x, int y )
                 current_gltf_file = (current_gltf_file - 1) % gltf_files.size();
             else
                 current_gltf_file = gltf_files.size() - 1;
-            setupScene(gltf_files[current_gltf_file]);
+            setupScene(current_gltf_file);
             setupCamera();
             break;
         }
@@ -1732,18 +1742,6 @@ void glutMouseMotion( int x, int y)
         camera_phi += -(b.x - a.x);
         camera_theta += (b.y - a.y);
         camera_dirty = true;
-
-        //camera_rotate = M44f::rotate(b.y - a.y, make_float3(1.f, 1.f, 0.f)) * M44f::rotate(a.x - b.x, make_float3(0.f, 1.f, 0.f));
-
-        //const auto v = camera_eye - camera_lookat;
-        //const auto rotated = M44f::rotate(a.x - b.x, camera_up) * make_float4(v.x, v.y, v.z, 0);
-        //const auto rotated_3 = make_float3(rotated.x, rotated.y, rotated.z);
-        //camera_eye = camera_lookat + rotated_3;
-
-        //const auto v2 = camera_eye - camera_lookat;
-        //const auto camera_left = optix::cross(rotated_3, camera_up);
-        //const auto rotated_again = M44f::rotate(b.y - a.y, camera_left) * make_float4(v2.x, v2.y, v2.z, 0);
-        //camera_eye = camera_lookat + make_float3(rotated_again.x, rotated_again.y, rotated_again.z);
 
         camera_dirty = true;
     }
@@ -1821,8 +1819,8 @@ void printUsageAndExit( const std::string& argv0 )
 
 int main( int argc, char** argv )
 {
-    std::string out_file;
-    std::string input_file;
+    fs::path out_dir;
+    fs::path input_file;
     for( int i=1; i<argc; ++i )
     {
         const std::string arg( argv[i] );
@@ -1831,14 +1829,14 @@ int main( int argc, char** argv )
         {
             printUsageAndExit( argv[0] );
         }
-        else if( arg == "-f" || arg == "--file"  )
+        else if( arg == "-o" || arg == "--output"  )
         {
             if( i == argc-1 )
             {
                 std::cerr << "Option '" << arg << "' requires additional argument.\n";
                 printUsageAndExit( argv[0] );
             }
-            out_file = argv[++i];
+            out_dir = argv[++i];
         }
         else if( arg == "-n" || arg == "--nopbo"  )
         {
@@ -1860,6 +1858,41 @@ int main( int argc, char** argv )
         }
     }
 
+    if (!out_dir.empty() && (!fs::is_directory(out_dir) || !fs::exists(out_dir)))
+    {
+        std::cerr << "Option -o: " << out_dir << " must be an existing directory" << std::endl;
+        exit(-1);
+    }
+
+    if (input_file.empty())
+    {
+        std::cerr << "No input file specified. Either specify a gltf file to open, or a directory that will be traversed recursively to find all gltf files under it." << std::endl;
+        exit(-1);
+    }
+
+    if (input_file.extension() == ".gltf")
+    {
+        gltf_files.emplace_back(input_file.string());
+    }
+    else if (fs::is_directory(input_file))
+    {
+        for (const auto dirEntry : fs::recursive_directory_iterator(input_file))
+        {
+            if (fs::is_regular_file(dirEntry) && dirEntry.path().extension() == ".gltf")
+                gltf_files.emplace_back(dirEntry.path().string());
+        }
+        for (size_t i = 0; i < gltf_files.size(); ++i)
+        {
+            std::cerr << i << " : " << gltf_files[i] << std::endl;
+        }
+    }
+    else
+    {
+        std::cerr << "Option -i: Either specify a gltf file to open, or a directory that will be traversed recursively to find all gltf files under it." << std::endl;
+        exit(-1);
+    }
+    current_gltf_file = current_gltf_file % gltf_files.size();
+
     try
     {
         glutInitialize( &argc, argv );
@@ -1871,24 +1904,90 @@ int main( int argc, char** argv )
         createContext();
         createMaterials();
 
-        if (input_file.empty())
-            input_file = gltf_files[current_gltf_file];
-
-        setupScene(input_file);
-        setupCamera();
         setupLights();
 
-        context->validate();
-
-        if ( out_file.empty() )
+        if ( out_dir.empty() )
         {
+            setupScene(current_gltf_file);
+            setupCamera();
+
+            context->validate();
+
             glutRun();
         }
         else
         {
-            updateCamera();
-            context->launch( 0, width, height );
-            sutil::displayBufferPPM( out_file.c_str(), getOutputBuffer() );
+            const size_t spp = 256;
+
+            json reports = json::array();
+            for (size_t i = 0; i < gltf_files.size(); ++i)
+            {
+                std::cout << "Rendering " << gltf_files[i] << std::endl;
+
+                setupScene(i);
+                setupCamera();
+                updateCamera();
+
+                clearFramebuffer();
+
+                context->validate();
+
+                const auto startTime = sutil::currentTime();
+                double timeAccum = 0.f;
+                double timeSqrAccum = 0.f;
+                double worstTime = 0.f;
+                double bestTime = std::numeric_limits<double>::max();
+
+                for (size_t s = 0; s < spp; ++s)
+                {
+                    const auto startFrameTime = sutil::currentTime();
+
+                    context["frame"]->setUint(s + 1);
+                    context->launch(0, width, height);
+                    if (s % 10 == 0)
+                        std::cerr << s << " / " << spp << std::endl;
+
+                    const auto frameTime = sutil::currentTime() - startFrameTime;
+                    timeAccum += frameTime;
+                    timeSqrAccum += frameTime * frameTime;
+                    worstTime = std::max(frameTime, worstTime);
+                    bestTime = std::min(frameTime, bestTime);
+                }
+
+                const auto totalTime = sutil::currentTime() - startTime;
+                const auto meanTime = timeAccum / spp;
+                const auto meanSqrTime = timeSqrAccum / spp;
+                const auto varianceTime = meanSqrTime - meanTime * meanTime;
+                const auto stdDevTime = std::sqrt(varianceTime);
+
+                const auto filename = gltf_files[i].stem();
+                const auto out_file = out_dir / ("render" + std::to_string(i) + ".ppm");
+                const auto out_file_str = out_file.string();
+                sutil::displayBufferPPM(out_file_str.c_str(), getOutputBuffer());
+
+                json report =
+                {
+                    { "input_file", gltf_files[i].string() },
+                    { "output_file", out_file_str },
+                    { "spp", spp },
+                    { "renderTime", {
+                        { "totalTime", totalTime },
+                        { "timeAccum", timeAccum },
+                        { "meanTime", meanTime },
+                        { "stdDevTime", stdDevTime },
+                        { "worstTime", worstTime },
+                        { "bestTime", bestTime }
+                    }}
+                };
+
+                reports.emplace_back(report);
+
+                {
+                    std::ofstream outTimes{ out_dir / "report.json" };
+                    outTimes << reports.dump(4);
+                }
+            }
+            
             destroyContext();
         }
         return 0;
